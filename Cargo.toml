@@ -1,0 +1,8 @@
+[workspace]
+members = [
+	"gui",
+	"cli",
+	"daemon",
+	"common"
+]
+
