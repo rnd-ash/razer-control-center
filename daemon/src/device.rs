@@ -1,6 +1,6 @@
 use rusb::{Device, DeviceDescriptor, DeviceHandle, Direction, EndpointDescriptor, EndpointDescriptors, GlobalContext, Result, TransferType, UsbContext};
 
-use crate::{TIMEOUT, razer::RazerPacket};
+use crate::{TIMEOUT, razer::{self, RazerCmdStatus, RazerError, RazerPacket, RazerResult}};
 
 const RAZER_VENDOR_ID: u16 = 0x1532;
 
@@ -102,12 +102,14 @@ impl<T: UsbContext> RazerDevice<T> {
                         // Now we don't have a kernel driver! No more spamming the kernel
                         endpoints.last_mut().unwrap().has_kernel_driver = false;
                     }
+
+                    let endpoint = endpoints.last().unwrap();
                     return Ok(Self {
                         device_type: dev_type,
                         handle,
                         device_descriptor: desc,
                         device: dev,
-                        endpoint: endpoints.last().unwrap().clone()
+                        endpoint: endpoint.clone()
                     })
                 }
             }
@@ -115,58 +117,60 @@ impl<T: UsbContext> RazerDevice<T> {
         Err(rusb::Error::NoDevice)
     }
 
-    pub fn write_and_read_cmd(&mut self, packet: RazerPacket) -> Option<RazerPacket> {
+    pub fn write_and_read_cmd(&mut self, packet: RazerPacket) -> RazerResult<RazerPacket> {
         if self.endpoint.has_kernel_driver {
-            if self.handle.detach_kernel_driver(self.endpoint.iface).is_err() {
-                return None
-            }
+            self.handle.detach_kernel_driver(self.endpoint.iface)?
         }
 
         #[cfg(windows)]
         {
-            if self.handle.set_active_configuration(self.endpoint.cfg).is_err() {
-                println!("set_active_configuration fail");
-                return None;
-            }
-            if self.handle.claim_interface(self.endpoint.iface).is_err() {
-                println!("claim_interface fail");
-                return None;
-            }
-            if self.handle.set_alternate_setting(self.endpoint.iface, self.endpoint.setting).is_err() {
-                println!("set_alternate_setting fail");
-                return None;
-            }
+            self.handle.set_active_configuration(self.endpoint.cfg)?;
+            self.handle.claim_interface(self.endpoint.iface)?;
+            self.handle.set_alternate_setting(self.endpoint.iface, self.endpoint.setting)?
         }
-        println!("Writing to '{:?}'", self.device_type);
 
         let mut buf = packet.create_packet();
 
-        match self.handle.write_control(0x21, 0x09, 0x300, self.endpoint.iface as u16, &buf, TIMEOUT) {
-            Ok(_) => {println!("Write OK!")},
-            Err(e) => println!("Error writing {}", e)
+        let mut last_err : Option<RazerError> = None;
+
+        for _ in 0..3 { // Try 3 times
+            if let Err(e) = self.handle.write_control(0x21, 0x09, 0x300, self.endpoint.iface as u16, &buf, TIMEOUT) {
+                last_err = Some(e.into());
+                continue
+            }
+            std::thread::sleep(std::time::Duration::from_micros(500));
+
+            for i in &mut buf { *i = 0 }; // Compiler turns this into memset!
+            if let Err(e) = self.handle.read_control(0xA1, 0x01, 0x300, self.endpoint.iface as u16, &mut buf, TIMEOUT) {
+                last_err = Some(e.into());
+                continue
+            }
+
+            let pkt = RazerPacket::from_raw(&buf);
+
+            if packet.is_same(&pkt) {
+                if pkt.status == RazerCmdStatus::Successful {
+                    if  self.endpoint.has_kernel_driver {
+                        self.handle.attach_kernel_driver(self.endpoint.iface).ok();
+                    }
+                    return Ok(pkt)
+                } else {
+                    last_err = Some(match pkt.status {
+                        RazerCmdStatus::Busy => RazerError::ECBusy,
+                        RazerCmdStatus::Failure => RazerError::ECFailure,
+                        RazerCmdStatus::Timeout => RazerError::ECTimeout,
+                        RazerCmdStatus::NotSupported => RazerError::CmdNotSupported,
+                        _ => RazerError::InvalidResponse // This should never happen, but cover incase
+                    })
+                }
+            } else {
+                last_err = Some(RazerError::InvalidResponse)
+            }
         }
-
-        std::thread::sleep(std::time::Duration::from_micros(1000));
-
-        for i in &mut buf { *i = 0 }; // Compiler turns this into memset!
-        match self.handle.read_control(0xA1, 0x01, 0x300, self.endpoint.iface as u16, &mut buf, TIMEOUT) {
-            Ok(_) => println!("Read OK!"),
-            Err(e) => println!("Error reading {}", e)
-        }
-
-        let pkt = RazerPacket::from_raw(&buf);
-
 
         if  self.endpoint.has_kernel_driver {
             self.handle.attach_kernel_driver(self.endpoint.iface).ok();
         }
-        
-        match packet.is_same(&pkt) {
-            true => Some(pkt),
-            false => {
-                eprintln!("Response did not equal request!");
-                None
-            }
-        }
+        Err(last_err.unwrap())
     }
 }

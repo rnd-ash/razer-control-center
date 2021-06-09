@@ -1,4 +1,5 @@
-use std::{borrow::BorrowMut, thread, time::Duration};
+use core::time;
+use std::{borrow::BorrowMut, thread, time::{Duration, Instant}};
 
 use device::RazerDevice;
 use hidapi::*;
@@ -16,11 +17,31 @@ fn main() {
     let mut context = Context::new().unwrap();
 
     let mut dev = RazerDevice::new(&mut context, 0x0233).unwrap();
-    let packet = razer::RazerPacket::new(0x0d, 0x01, &[0x00, 0x00, 0x00, 0x00]);
+
+
+    let mut packet = razer::RazerPacket::new(0x03, 0x0b, &[0xFF, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00]);
+    packet.data_size = 60;
+    packet.args[15..60].copy_from_slice(&[0xFFu8; 45]);
     println!("OUT -> {}", packet);
+    let start = Instant::now();
     match dev.write_and_read_cmd(packet) {
-        Some(p) => println!("IN <- {}", p),
-        None => println!("IN <- ERROR")
+        Ok(p) => {
+            println!("Took {} us", start.elapsed().as_micros());
+            println!("IN <- {}", p)
+        },
+        Err(e) => println!("IN <- ERROR {:?}", e)
+    }
+
+    let mut packet = razer::RazerPacket::new(0x03, 0x0a, &[0x05, 0x00]);
+    packet.data_size = 60;
+    println!("OUT -> {}", packet);
+    let start = Instant::now();
+    match dev.write_and_read_cmd(packet) {
+        Ok(p) => {
+            println!("Took {} us", start.elapsed().as_micros());
+            println!("IN <- {}", p)
+        },
+        Err(e) => println!("IN <- ERROR {:?}", e)
     }
 
     /*

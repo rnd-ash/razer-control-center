@@ -6,7 +6,18 @@ pub type RazerResult<T> = std::result::Result<T, RazerError>;
 
 #[derive(Debug)]
 pub enum RazerError {
+    UsbError(rusb::Error),
+    CmdNotSupported,
+    ECBusy,
+    ECTimeout,
+    InvalidResponse,
+    ECFailure
+}
 
+impl From<rusb::Error> for RazerError {
+    fn from(x: rusb::Error) -> Self {
+        Self::UsbError(x)
+    }
 }
 
 
