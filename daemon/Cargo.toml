@@ -9,3 +9,8 @@ edition = "2018"
 [dependencies]
 hidapi = "1.2.6"
 rusb = "0.8.1"
+lazy_static = "1.4.0"
+common = { path = "../common/" }
+smbios-lib = "0.7.7"
+rand = "0.8.3"
+libusb1-sys = "0.5.0"

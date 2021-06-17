@@ -7,6 +7,7 @@ pub type RazerResult<T> = std::result::Result<T, RazerError>;
 #[derive(Debug)]
 pub enum RazerError {
     UsbError(rusb::Error),
+    HidError(hidapi::HidError),
     CmdNotSupported,
     ECBusy,
     ECTimeout,
@@ -17,6 +18,12 @@ pub enum RazerError {
 impl From<rusb::Error> for RazerError {
     fn from(x: rusb::Error) -> Self {
         Self::UsbError(x)
+    }
+}
+
+impl From<hidapi::HidError> for RazerError {
+    fn from(x: hidapi::HidError) -> Self {
+        Self::HidError(x)
     }
 }
 
@@ -36,6 +43,7 @@ pub enum RazerCmdStatus {
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RazerPacket {
+    report_index: u8,
     pub status: RazerCmdStatus,
     pub id: u8,
     pub remaining: u16,
@@ -58,18 +66,16 @@ impl RazerPacket {
 
     pub fn set_crc(&mut self) {
         let raw = unsafe { ::std::slice::from_raw_parts((self as *const  Self) as *const u8, ::std::mem::size_of::<Self>()) };
-        let mut res = 0;
-        for i in 2..88 {
-            res ^= raw[i];
-        }
-        self.crc = res;
+        self.crc = 0;
+        raw[2..88].iter().for_each(|x| self.crc ^= *x);
     }
 
     pub fn new(class: u8, cmd: u8, args: &[u8]) -> Self {
         let max = min(80, args.len());
         let mut tmp = Self {
+            report_index: 0,
             status: RazerCmdStatus::New,
-            id: 0x1F,
+            id: 0xFF,
             remaining: 0x00,
             protocol_type: 0x00,
             data_size: max as u8,
@@ -84,7 +90,7 @@ impl RazerPacket {
         tmp
     }
 
-    pub fn is_same(&self, other: &Self) -> bool {
+    pub const fn is_same(&self, other: &Self) -> bool {
         self.remaining == other.remaining && self.cmd_class == other.cmd_class && self.id == other.id
     }
 
@@ -95,14 +101,11 @@ impl RazerPacket {
         self.set_crc();
     }
 
-    pub fn create_packet(&self) -> [u8; 90] {
-        let raw = unsafe { ::std::slice::from_raw_parts((self as *const Self) as *const u8, ::std::mem::size_of::<Self>()) };
-        let mut ret = [0; 90];
-        ret.copy_from_slice(&raw[0..90]);
-        ret
+    pub fn create_packet(&self) -> &[u8] {
+        unsafe { ::std::slice::from_raw_parts((self as *const Self) as *const u8, ::std::mem::size_of::<Self>()) }
     }
 
-    pub fn from_raw(buf: &[u8; 90]) -> Self {
+    pub fn from_raw(buf: &[u8; 91]) -> Self {
         unsafe { std::ptr::read(buf.as_ptr() as *const Self) }
     }
 }

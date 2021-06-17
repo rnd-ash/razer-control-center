@@ -1,176 +1,132 @@
-use rusb::{Device, DeviceDescriptor, DeviceHandle, Direction, EndpointDescriptor, EndpointDescriptors, GlobalContext, Result, TransferType, UsbContext};
+use core::panic;
 
-use crate::{TIMEOUT, razer::{self, RazerCmdStatus, RazerError, RazerPacket, RazerResult}};
+use common::hw::DeviceType;
+use hidapi::{HidApi, HidDevice};
+use smbioslib::{SMBiosSystemInformation, table_load_from_device};
 
-const RAZER_VENDOR_ID: u16 = 0x1532;
-
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord)]
-pub enum DeviceType {
-    /// Laptop - Power and keyboard backlight controls are available
-    Laptop(&'static str),
-    /// Mouse
-    Mouse(&'static str),
-    /// Keyboard - Only RGB control is available
-    Keyboard(&'static str),
-    /// Unknown device. Will show up as 'generic'
-    Unknown(u16)
-}
+use crate::razer::{RazerCmdStatus, RazerError, RazerPacket, RazerResult};
 
 
-impl DeviceType {
-    pub fn from_id(id: u16) -> Self {
-        match id {
-            0x023B => Self::Laptop("Razer blade 2018 (Base)"),
-            0x0233 => Self::Laptop("Razer blade 2018 (Adv)"),
-            0x0244 => Self::Laptop("Razer blade 2019 (Adv)"),
-            x => Self::Unknown(x)
-        }
-    }
-}
 
-#[derive(Debug, Copy, Clone)]
-struct Endpoint {
-    pub (crate) cfg: u8,
-    pub (crate) iface: u8,
-    pub (crate) setting: u8,
-    pub (crate) addr: u8,
-    pub (crate) has_kernel_driver: bool,
-    pub (crate) transfer_type: TransferType
-}
+pub const RAZER_VENDOR_ID: u16 = 0x1532;
 
-pub struct RazerDevice<T: UsbContext> {
+
+pub struct RazerDevice {
     pub device_type: DeviceType,
-    handle: DeviceHandle<T>,
-    device_descriptor: DeviceDescriptor,
-    device: Device<T>,
-    endpoint: Endpoint
+    pub serial: String,
+    pub device: HidDevice,
 }
+ 
 
-impl<T: UsbContext> RazerDevice<T> {
-    pub fn new(ctx: &mut T, pid: u16) -> Result<Self> {
-        let dev_type = DeviceType::from_id(pid);
-
-        let dev_list = ctx.devices()?;
-        for dev in dev_list.iter() {
-            let desc = dev.device_descriptor()?;
-
-            if desc.vendor_id() == RAZER_VENDOR_ID && desc.product_id() == pid {
-                let mut handle  = dev.open()?;
-
-                for n in 0..desc.num_configurations() {
-                    let cfg = match dev.config_descriptor(n) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            println!("Error reading cfg {}", e);
-                            continue;
-                        }
-                    };
-                    
-                    let mut endpoints: Vec<Endpoint> = Vec::new();
-
-                    for iface in cfg.interfaces() {
-                        for iface_desc in iface.descriptors() {
-                            for endpoint_desc in iface_desc.endpoint_descriptors() {
-                                if endpoint_desc.direction() == Direction::In 
-                                && iface_desc.protocol_code() == 0x02 { // Mouse
-                                    let has_kernel_driver = handle.kernel_driver_active(iface_desc.interface_number()).unwrap_or(false);
-
-                                    endpoints.push(Endpoint{
-                                        cfg: cfg.number(),
-                                        iface: iface_desc.interface_number(),
-                                        setting: iface_desc.setting_number(),
-                                        addr: iface_desc.setting_number(),
-                                        transfer_type: endpoint_desc.transfer_type(),
-                                        has_kernel_driver
-                                    })
-                                }
-                            }
-                        }
-                    }
-
-                    // On razer laptops, multiple endpoints are located for the laptops EC
-                    // First tends to be keyboard
-                    // Second tends to be the mouse
-                    // Only the last one is the EC, and so we can detach the kernel driver PERMANENTLY
-                    // This saves us spamming kernel log, and also reduces some overhead :)
-
-                    if endpoints.len() > 1 {
-                        let laptop_maybe_endpoint = endpoints.last().unwrap();
-                        if laptop_maybe_endpoint.has_kernel_driver {
-                            handle.detach_kernel_driver(laptop_maybe_endpoint.iface)?;
-                        }
-                        // Now we don't have a kernel driver! No more spamming the kernel
-                        endpoints.last_mut().unwrap().has_kernel_driver = false;
-                    }
-
-                    let endpoint = endpoints.last().unwrap();
-                    return Ok(Self {
-                        device_type: dev_type,
-                        handle,
-                        device_descriptor: desc,
-                        device: dev,
-                        endpoint: endpoint.clone()
+impl RazerDevice {
+    pub fn scan_devices(api: &mut HidApi) -> RazerResult<Vec<Self>> {
+        let mut located: Vec<Self> = Vec::new();
+        for d in api.device_list() {
+            #[cfg(windows)]
+            if d.vendor_id() == RAZER_VENDOR_ID && d.usage() == 0x02 {
+                let device = DeviceType::from_id(d.product_id());
+                if let Ok(data) = d.open_device(api) {
+                    located.push(Self {
+                        device_type: device,
+                        serial: "UNKNOWN SN".into(),
+                        device: data
                     })
                 }
             }
+            #[cfg(unix)]
+            if d.vendor_id() == RAZER_VENDOR_ID {
+                let device = DeviceType::from_id(d.product_id());
+                if let Ok(data) = d.open_device(api) {
+                    let mut maybe = Self {
+                        device_type: device,
+                        serial: "UNKNOWN SN".into(),
+                        device: data,
+                    };
+                    maybe.get_serial_number();
+                    if located.iter().find(|x| x.serial == maybe.serial).is_none() {
+                        located.push(maybe)
+                    }
+                }
+            }
         }
-        Err(rusb::Error::NoDevice)
+
+        Ok(located)
+    }
+
+    // Attempts to get Razers serial number and sets it to the device
+    fn get_serial_number(&mut self) {
+        if self.device_type.is_laptop() {
+            // We do it differently
+            if let Ok(table) = table_load_from_device() {
+                match table.find_map(|sys_info: SMBiosSystemInformation| sys_info.serial_number()) {
+                    Some(uuid) => { self.serial = uuid },
+                    _ => {}
+                }
+            }
+            return;
+        }
+
+        let packet = RazerPacket::new(0x00, 0x82, &[0u8; 16]);
+        if let Ok(resp) = self.write_and_read_cmd(packet){
+            if let Ok(s) = String::from_utf8(Vec::from(&resp.args[0..resp.data_size as usize])) {
+                println!("Serial: {}", s);
+                self.serial = s;
+            }
+        }  else {
+            println!("Error getting Serial number for {}", self.device_type.get_name());
+        }
+    }
+
+    fn get_fw_version(&mut self) {
+        println!("{:?}", self.write_and_read_cmd(RazerPacket::new(0x00, 0x81, &[0u8; 2])))
     }
 
     pub fn write_and_read_cmd(&mut self, packet: RazerPacket) -> RazerResult<RazerPacket> {
-        if self.endpoint.has_kernel_driver {
-            self.handle.detach_kernel_driver(self.endpoint.iface)?
-        }
+        let mut buf: [u8; 91] = [0; 91];
+        buf.copy_from_slice(&packet.create_packet());
 
-        #[cfg(windows)]
-        {
-            self.handle.set_active_configuration(self.endpoint.cfg)?;
-            self.handle.claim_interface(self.endpoint.iface)?;
-            self.handle.set_alternate_setting(self.endpoint.iface, self.endpoint.setting)?
-        }
-
-        let mut buf = packet.create_packet();
-
-        let mut last_err : Option<RazerError> = None;
-
-        for _ in 0..3 { // Try 3 times
-            if let Err(e) = self.handle.write_control(0x21, 0x09, 0x300, self.endpoint.iface as u16, &buf, TIMEOUT) {
-                last_err = Some(e.into());
-                continue
+        let mut err = RazerError::ECTimeout;
+        for _ in 0..3 { // Try sending packet 3 times
+            if let Err(e) = self.device.send_feature_report(&buf) {
+                err = e.into();
+                std::thread::sleep(std::time::Duration::from_micros(400));
+                continue;
             }
-            std::thread::sleep(std::time::Duration::from_micros(500));
-
-            for i in &mut buf { *i = 0 }; // Compiler turns this into memset!
-            if let Err(e) = self.handle.read_control(0xA1, 0x01, 0x300, self.endpoint.iface as u16, &mut buf, TIMEOUT) {
-                last_err = Some(e.into());
-                continue
-            }
-
-            let pkt = RazerPacket::from_raw(&buf);
-
-            if packet.is_same(&pkt) {
-                if pkt.status == RazerCmdStatus::Successful {
-                    if  self.endpoint.has_kernel_driver {
-                        self.handle.attach_kernel_driver(self.endpoint.iface).ok();
+            std::thread::sleep(std::time::Duration::from_micros(400));
+            match self.device.get_feature_report(&mut buf) {
+                Ok(read_count) => {
+                    if read_count != 91 {
+                        continue; // Try again!
                     }
-                    return Ok(pkt)
+                },
+                Err(e) => {
+                    err = e.into();
+                    continue;
+                }
+            }
+            let new = RazerPacket::from_raw(&buf);
+            if packet.is_same(&new) {
+                if new.status == RazerCmdStatus::Successful {
+                    return Ok(new)
                 } else {
-                    last_err = Some(match pkt.status {
-                        RazerCmdStatus::Busy => RazerError::ECBusy,
+                    err = match new.status {
+                        RazerCmdStatus::Busy => {
+                            std::thread::sleep(std::time::Duration::from_micros(1000));
+                            RazerError::ECBusy
+                        },
                         RazerCmdStatus::Failure => RazerError::ECFailure,
                         RazerCmdStatus::Timeout => RazerError::ECTimeout,
-                        RazerCmdStatus::NotSupported => RazerError::CmdNotSupported,
-                        _ => RazerError::InvalidResponse // This should never happen, but cover incase
-                    })
+                        _ => panic!("Attempted to create Razer error from OK packet!?")
+                    }
                 }
             } else {
-                last_err = Some(RazerError::InvalidResponse)
+                err = RazerError::InvalidResponse
             }
         }
+        Err(err)
+    }
 
-        if  self.endpoint.has_kernel_driver {
-            self.handle.attach_kernel_driver(self.endpoint.iface).ok();
-        }
-        Err(last_err.unwrap())
+    pub fn write_cmd(&mut self, packet: RazerPacket) -> RazerResult<()> {
+        Ok(self.device.send_feature_report(&packet.create_packet())?)
     }
 }
